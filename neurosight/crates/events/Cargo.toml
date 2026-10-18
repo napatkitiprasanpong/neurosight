@@ -1,0 +1,8 @@
+[package]
+name = "neurosight-events"
+version.workspace = true
+edition.workspace = true
+description = "Turns camera frames into events (still / moving / waving)"
+
+[dependencies]
+neurosight-common = { path = "../common" }

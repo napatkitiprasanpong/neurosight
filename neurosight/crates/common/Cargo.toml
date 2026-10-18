@@ -1,0 +1,5 @@
+[package]
+name = "neurosight-common"
+version.workspace = true
+edition.workspace = true
+description = "Shared types for NeuroSight (frames, actions, events)"

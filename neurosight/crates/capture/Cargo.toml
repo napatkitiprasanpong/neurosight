@@ -1,0 +1,9 @@
+[package]
+name = "neurosight-capture"
+version.workspace = true
+edition.workspace = true
+description = "Webcam capture for NeuroSight"
+
+[dependencies]
+neurosight-common = { path = "../common" }
+nokhwa = { version = "0.10", features = ["input-native"] }

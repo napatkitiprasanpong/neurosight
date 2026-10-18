@@ -1,0 +1,10 @@
+[package]
+name = "neurosight-perception"
+version.workspace = true
+edition.workspace = true
+description = "Body pose estimation (MoveNet via ONNX Runtime) for NeuroSight"
+
+[dependencies]
+neurosight-common = { path = "../common" }
+# Pinned: the ort 2.0 release candidates change their API between versions.
+ort = "=2.0.0-rc.12"

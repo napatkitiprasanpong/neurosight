@@ -1,0 +1,15 @@
+[package]
+name = "neurosight-app"
+version.workspace = true
+edition.workspace = true
+description = "NeuroSight command-line app: webcam in, text out"
+
+[[bin]]
+name = "neurosight"
+path = "src/main.rs"
+
+[dependencies]
+neurosight-common = { path = "../common" }
+neurosight-capture = { path = "../capture" }
+neurosight-events = { path = "../events" }
+neurosight-perception = { path = "../perception" }
