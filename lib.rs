@@ -1,442 +1,264 @@
-//! Event engine: turns camera data into events.
+//! Pose estimation with MoveNet SinglePose (Lightning or Thunder) through ONNX Runtime.
 //!
-//! Two analyzers produce the same `Event` type:
+//! Expected model (as exported from TensorFlow Hub):
+//!   input : a square RGB image, values 0-255, as [1, size, size, 3] (NHWC) or
+//!           [1, 3, size, size] (NCHW), integer or float
+//!   output: [1, 1, 17, 3]  per keypoint: y, x, confidence (all 0.0-1.0)
 //!
-//! * `MotionAnalyzer` (this file): grayscale frames in, still / moving / waving out.
-//!   No machine learning, works without any model file.
-//! * `PoseAnalyzer` (`pose.rs`): body keypoints in, appeared / waving / present / left
-//!   out, with side, rough distance and whether the person faces the camera.
+//! Exports differ, so `load` tries the four combinations (NHWC int32, NHWC float32,
+//! NCHW float32, NCHW int32) with a blank test image and remembers the first that works.
+//! If none works, the error lists what the model said about each attempt.
 //!
-//! `MotionAnalyzer` uses simple motion analysis:
-//!
-//! 1. Compare each frame with the previous one to find the pixels that changed.
-//! 2. Track the horizontal center of that motion over the last ~1.5 seconds.
-//! 3. If the center swings left and right several times at a hand-wave
-//!    frequency (about 1-6 Hz), call it waving.
-//!
-//! Later versions replace step 1-3 with body-pose models, but they will keep
-//! producing the same `Event` type.
+//! See `models/README.md` for how to get the model file.
 
-use std::collections::VecDeque;
+use std::fmt;
+use std::path::Path;
 
-use neurosight_common::{Action, Event, GrayFrame, Zone};
+use neurosight_common::{Keypoint, Pose, RgbFrame, KEYPOINT_COUNT};
+use ort::session::Session;
+use ort::value::Tensor;
 
-mod pose;
-pub use pose::{PoseAnalyzer, PoseConfig, PoseDebug};
+/// Input size of MoveNet SinglePose Lightning. (Thunder uses 256.)
+pub const LIGHTNING_INPUT_SIZE: usize = 192;
 
-/// Tunable thresholds. The defaults are a starting point: expect to adjust
-/// them for your camera and lighting (run the app with `--debug`).
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// A pixel counts as "changed" if it differs by more than this (0-255).
-    pub pixel_threshold: u8,
-    /// Fraction of pixels that must change for the frame to count as motion.
-    pub min_motion_ratio: f32,
-    /// If more than this fraction changes, treat it as a lighting/exposure
-    /// change (not a person) and ignore the frame.
-    pub max_motion_ratio: f32,
-    /// How many seconds of motion history to analyze.
-    pub window_s: f64,
-    /// Direction changes needed within the window to call it a wave.
-    pub min_reversals: usize,
-    /// Minimum sideways swing (fraction of image width) for a direction change.
-    pub min_swing: f32,
-    /// Allowed wave frequency range in Hz.
-    pub min_freq_hz: f64,
-    pub max_freq_hz: f64,
-    /// Keep the current state this long after the evidence disappears.
-    pub hold_s: f64,
-    /// Minimum seconds between "same action, different side" announcements.
-    pub zone_cooldown_s: f64,
-    /// Waving is only evaluated if there was motion this recently.
-    pub recent_s: f64,
+#[derive(Debug)]
+pub struct PerceptionError(pub String);
+
+impl fmt::Display for PerceptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pose model error: {}", self.0)
+    }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            pixel_threshold: 25,
-            min_motion_ratio: 0.008,
-            max_motion_ratio: 0.60,
-            window_s: 1.5,
-            min_reversals: 4,
-            min_swing: 0.03,
-            min_freq_hz: 1.0,
-            max_freq_hz: 6.0,
-            hold_s: 0.8,
-            zone_cooldown_s: 1.5,
-            recent_s: 0.3,
+impl std::error::Error for PerceptionError {}
+
+fn err<E: fmt::Display>(e: E) -> PerceptionError {
+    PerceptionError(e.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// [1, height, width, 3]
+    Nhwc,
+    /// [1, 3, height, width]
+    Nchw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dtype {
+    Int32,
+    Float32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputKind {
+    layout: Layout,
+    dtype: Dtype,
+}
+
+impl InputKind {
+    fn label(&self) -> &'static str {
+        match (self.layout, self.dtype) {
+            (Layout::Nhwc, Dtype::Int32) => "NHWC int32",
+            (Layout::Nhwc, Dtype::Float32) => "NHWC float32",
+            (Layout::Nchw, Dtype::Int32) => "NCHW int32",
+            (Layout::Nchw, Dtype::Float32) => "NCHW float32",
         }
     }
 }
 
-/// Numbers from the latest frame, useful for tuning.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameStats {
-    pub motion_ratio: f32,
-    pub centroid_x: Option<f32>,
-    pub reversals: usize,
+/// The input formats to try, most likely first.
+const CANDIDATES: [InputKind; 4] = [
+    InputKind {
+        layout: Layout::Nhwc,
+        dtype: Dtype::Int32,
+    },
+    InputKind {
+        layout: Layout::Nhwc,
+        dtype: Dtype::Float32,
+    },
+    InputKind {
+        layout: Layout::Nchw,
+        dtype: Dtype::Float32,
+    },
+    InputKind {
+        layout: Layout::Nchw,
+        dtype: Dtype::Int32,
+    },
+];
+
+pub struct PoseEstimator {
+    session: Session,
+    size: usize,
+    kind: InputKind,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Sample {
-    t: f64,
-    cx: f32,
-}
+impl PoseEstimator {
+    /// Load a MoveNet ONNX model. `input_size` is 192 for Lightning, 256 for Thunder.
+    pub fn load(model_path: impl AsRef<Path>, input_size: usize) -> Result<Self, PerceptionError> {
+        let mut session = Session::builder()
+            .map_err(err)?
+            .commit_from_file(model_path.as_ref())
+            .map_err(err)?;
 
-pub struct MotionAnalyzer {
-    cfg: Config,
-    prev: Option<GrayFrame>,
-    samples: VecDeque<Sample>,
-    state: Action,
-    last_zone: Option<Zone>,
-    last_cx: f32,
-    last_motion_t: f64,
-    last_wave_t: f64,
-    last_emit_t: f64,
-    stats: FrameStats,
-}
-
-impl MotionAnalyzer {
-    pub fn new(cfg: Config) -> Self {
-        Self {
-            cfg,
-            prev: None,
-            samples: VecDeque::new(),
-            state: Action::Still,
-            last_zone: None,
-            last_cx: 0.5,
-            last_motion_t: f64::NEG_INFINITY,
-            last_wave_t: f64::NEG_INFINITY,
-            last_emit_t: f64::NEG_INFINITY,
-            stats: FrameStats::default(),
-        }
-    }
-
-    pub fn state(&self) -> Action {
-        self.state
-    }
-
-    pub fn stats(&self) -> FrameStats {
-        self.stats
-    }
-
-    /// Feed one frame (with its timestamp in seconds). Returns an event only
-    /// when something worth announcing changes.
-    pub fn process(&mut self, frame: &GrayFrame, t: f64) -> Option<Event> {
-        // Need a previous frame of the same size to measure motion.
-        let prev = match self.prev.replace(frame.clone()) {
-            Some(p) if p.width == frame.width && p.height == frame.height => p,
-            _ => {
-                self.samples.clear();
-                return None;
-            }
-        };
-
-        let (ratio, cx) = frame_motion(&prev, frame, self.cfg.pixel_threshold);
-        let moving = ratio >= self.cfg.min_motion_ratio && ratio <= self.cfg.max_motion_ratio;
-
-        if moving {
-            if let Some(cx) = cx {
-                self.samples.push_back(Sample { t, cx });
-                self.last_cx = cx;
+        // Find out which input format the model accepts, using a blank test image.
+        let blank = vec![0u8; input_size * input_size * 3];
+        let mut failures: Vec<String> = Vec::new();
+        let mut chosen: Option<InputKind> = None;
+        for kind in CANDIDATES {
+            match run_raw(&mut session, kind, input_size, &blank) {
+                Ok(out) if out.len() >= KEYPOINT_COUNT * 3 => {
+                    chosen = Some(kind);
+                    break;
+                }
+                Ok(out) => failures.push(format!(
+                    "{}: ran, but the output has {} numbers (expected at least {})",
+                    kind.label(),
+                    out.len(),
+                    KEYPOINT_COUNT * 3
+                )),
+                Err(e) => failures.push(format!("{}: {}", kind.label(), shorten(&e.0))),
             }
         }
-        let cutoff = t - self.cfg.window_s;
-        while self.samples.front().map_or(false, |s| s.t < cutoff) {
-            self.samples.pop_front();
-        }
+        let kind = chosen.ok_or_else(|| {
+            PerceptionError(format!(
+                "the model did not accept any input format I know. What it said: {}",
+                failures.join(" | ")
+            ))
+        })?;
 
-        // Is the motion a wave?
-        let recent = self
-            .samples
-            .back()
-            .map_or(false, |s| s.t >= t - self.cfg.recent_s);
-        let mut waving = false;
-        let mut reversals = 0usize;
-        if recent && self.samples.len() >= 6 {
-            let first_t = self.samples.front().map(|s| s.t).unwrap_or(t);
-            let last_t = self.samples.back().map(|s| s.t).unwrap_or(t);
-            let span = last_t - first_t;
-            if span >= 0.6 {
-                let xs: Vec<f32> = self.samples.iter().map(|s| s.cx).collect();
-                let xs = smooth3(&xs);
-                reversals = count_reversals(&xs, self.cfg.min_swing);
-                let freq = reversals as f64 / 2.0 / span;
-                waving = reversals >= self.cfg.min_reversals
-                    && freq >= self.cfg.min_freq_hz
-                    && freq <= self.cfg.max_freq_hz;
-            }
-        }
-        self.stats = FrameStats {
-            motion_ratio: ratio,
-            centroid_x: cx,
-            reversals,
-        };
+        Ok(Self {
+            session,
+            size: input_size,
+            kind,
+        })
+    }
 
-        // Pick the action, with a little hysteresis so it does not flicker.
-        let mut action = if waving {
-            Action::Waving
-        } else if moving {
-            Action::Moving
-        } else {
-            Action::Still
-        };
-        if waving {
-            self.last_wave_t = t;
-        }
-        if moving {
-            self.last_motion_t = t;
-        }
-        if action != Action::Waving
-            && self.state == Action::Waving
-            && t - self.last_wave_t < self.cfg.hold_s
-        {
-            action = Action::Waving;
-        }
-        if action == Action::Still
-            && self.state != Action::Still
-            && t - self.last_motion_t < self.cfg.hold_s
-        {
-            action = Action::Moving;
-        }
+    pub fn input_size(&self) -> usize {
+        self.size
+    }
 
-        // Where is it happening?
-        let zone = if action == Action::Still {
-            None
-        } else {
-            let mean_x = if self.samples.is_empty() {
-                self.last_cx
-            } else {
-                self.samples.iter().map(|s| s.cx).sum::<f32>() / self.samples.len() as f32
-            };
-            Some(Zone::from_x(mean_x))
-        };
+    /// For example "NHWC int32" (shown in the start-up message).
+    pub fn input_description(&self) -> &'static str {
+        self.kind.label()
+    }
 
-        let action_changed = action != self.state;
-        let zone_changed = action != Action::Still
-            && zone != self.last_zone
-            && t - self.last_emit_t >= self.cfg.zone_cooldown_s;
-
-        if action_changed || zone_changed {
-            self.state = action;
-            self.last_zone = zone;
-            self.last_emit_t = t;
-            let confidence = match action {
-                Action::Still => 1.0,
-                Action::Moving => (ratio / 0.05).clamp(0.3, 1.0),
-                Action::Waving => (reversals as f32 / 8.0).clamp(0.5, 1.0),
-                // The motion analyzer never produces these (pose mode only).
-                Action::Appeared | Action::Present | Action::Left => 1.0,
-            };
-            return Some(Event {
-                time_s: t,
-                action,
-                zone,
-                distance: None,
-                facing_camera: false,
-                confidence,
-            });
+    /// Estimate the pose in a square RGB frame of exactly `input_size` x `input_size`.
+    pub fn estimate(&mut self, frame: &RgbFrame) -> Result<Pose, PerceptionError> {
+        if frame.width != self.size || frame.height != self.size {
+            return Err(PerceptionError(format!(
+                "frame is {}x{} but the model needs {}x{}",
+                frame.width, frame.height, self.size, self.size
+            )));
         }
-        None
+        let out = run_raw(&mut self.session, self.kind, self.size, &frame.data)?;
+        parse_movenet_output(&out).ok_or_else(|| {
+            PerceptionError(format!("model output too short: {} numbers", out.len()))
+        })
     }
 }
 
-/// Returns (fraction of pixels that changed, horizontal center of the change
-/// as 0.0 = left edge .. 1.0 = right edge).
-fn frame_motion(prev: &GrayFrame, cur: &GrayFrame, threshold: u8) -> (f32, Option<f32>) {
-    let mut count: usize = 0;
-    let mut sum_x: f64 = 0.0;
-    for y in 0..cur.height {
-        let row = y * cur.width;
-        for x in 0..cur.width {
-            let a = prev.data[row + x];
-            let b = cur.data[row + x];
-            if a.abs_diff(b) > threshold {
-                count += 1;
-                sum_x += x as f64;
-            }
-        }
-    }
-    let total = (cur.width * cur.height).max(1);
-    let ratio = count as f32 / total as f32;
-    let cx = if count > 0 {
-        Some(((sum_x / count as f64) + 0.5) as f32 / cur.width.max(1) as f32)
+fn shorten(message: &str) -> String {
+    let one_line: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 240 {
+        let cut: String = one_line.chars().take(240).collect();
+        format!("{}...", cut)
     } else {
-        None
-    };
-    (ratio, cx)
+        one_line
+    }
 }
 
-/// 3-point moving average (keeps the end points).
-pub(crate) fn smooth3(xs: &[f32]) -> Vec<f32> {
-    if xs.len() < 3 {
-        return xs.to_vec();
-    }
-    let mut out = Vec::with_capacity(xs.len());
-    out.push(xs[0]);
-    for i in 1..xs.len() - 1 {
-        out.push((xs[i - 1] + xs[i] + xs[i + 1]) / 3.0);
-    }
-    out.push(xs[xs.len() - 1]);
-    out
-}
-
-/// Count how many times the signal changes direction by more than `min_swing`.
-pub(crate) fn count_reversals(xs: &[f32], min_swing: f32) -> usize {
-    if xs.len() < 3 {
-        return 0;
-    }
-    let mut reversals = 0usize;
-    let mut extreme = xs[0];
-    let mut dir: i8 = 0; // 0 = unknown, 1 = rising, -1 = falling
-    for &x in &xs[1..] {
-        match dir {
-            0 => {
-                if x - extreme > min_swing {
-                    dir = 1;
-                    extreme = x;
-                } else if extreme - x > min_swing {
-                    dir = -1;
-                    extreme = x;
-                }
-            }
-            1 => {
-                if x > extreme {
-                    extreme = x;
-                } else if extreme - x > min_swing {
-                    dir = -1;
-                    extreme = x;
-                    reversals += 1;
-                }
-            }
-            _ => {
-                if x < extreme {
-                    extreme = x;
-                } else if x - extreme > min_swing {
-                    dir = 1;
-                    extreme = x;
-                    reversals += 1;
-                }
-            }
+/// Rearrange packed RGB (R,G,B,R,G,B,...) into planes (all R, then all G, then all B).
+fn to_planar(rgb: &[u8], pixels: usize) -> Vec<u8> {
+    let mut planar = Vec::with_capacity(pixels * 3);
+    for channel in 0..3 {
+        for i in 0..pixels {
+            planar.push(rgb[i * 3 + channel]);
         }
     }
-    reversals
+    planar
+}
+
+/// Run the model once and return the flat output numbers.
+fn run_raw(
+    session: &mut Session,
+    kind: InputKind,
+    size: usize,
+    rgb: &[u8],
+) -> Result<Vec<f32>, PerceptionError> {
+    let (shape, bytes): ([usize; 4], Vec<u8>) = match kind.layout {
+        Layout::Nhwc => ([1, size, size, 3], rgb.to_vec()),
+        Layout::Nchw => ([1, 3, size, size], to_planar(rgb, size * size)),
+    };
+    let outputs = match kind.dtype {
+        Dtype::Int32 => {
+            let data: Vec<i32> = bytes.iter().map(|&v| v as i32).collect();
+            let tensor = Tensor::from_array((shape, data)).map_err(err)?;
+            session.run(ort::inputs![tensor]).map_err(err)?
+        }
+        Dtype::Float32 => {
+            let data: Vec<f32> = bytes.iter().map(|&v| v as f32).collect();
+            let tensor = Tensor::from_array((shape, data)).map_err(err)?;
+            session.run(ort::inputs![tensor]).map_err(err)?
+        }
+    };
+    let (_shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(err)?;
+    Ok(data.to_vec())
+}
+
+/// Turn the model's flat output (17 x [y, x, score]) into a `Pose`.
+pub fn parse_movenet_output(data: &[f32]) -> Option<Pose> {
+    if data.len() < KEYPOINT_COUNT * 3 {
+        return None;
+    }
+    let mut keypoints = [Keypoint::default(); KEYPOINT_COUNT];
+    for (i, k) in keypoints.iter_mut().enumerate() {
+        *k = Keypoint {
+            y: data[i * 3],
+            x: data[i * 3 + 1],
+            score: data[i * 3 + 2],
+        };
+    }
+    Some(Pose::new(keypoints))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::PI;
+    use neurosight_common::kp;
 
-    const W: usize = 80;
-    const H: usize = 60;
-    const FPS: f64 = 30.0;
-
-    /// Gray background with a bright 8x8 block whose left edge is at `x`.
-    fn frame_with_block(x: i32) -> GrayFrame {
-        let mut data = vec![100u8; W * H];
-        for y in 25..33 {
-            for dx in 0..8 {
-                let xx = x + dx;
-                if xx >= 0 && (xx as usize) < W {
-                    data[y * W + xx as usize] = 220;
-                }
-            }
+    #[test]
+    fn parses_y_x_score_order() {
+        // Keypoint i gets y = i/100, x = i/100 + 0.5, score = 0.9
+        let mut data = Vec::new();
+        for i in 0..17 {
+            data.push(i as f32 / 100.0);
+            data.push(i as f32 / 100.0 + 0.5);
+            data.push(0.9);
         }
-        GrayFrame::new(W, H, data)
-    }
-
-    fn run(frames: &[GrayFrame]) -> Vec<Event> {
-        let mut analyzer = MotionAnalyzer::new(Config::default());
-        let mut events = Vec::new();
-        for (i, f) in frames.iter().enumerate() {
-            if let Some(e) = analyzer.process(f, i as f64 / FPS) {
-                events.push(e);
-            }
-        }
-        events
+        let pose = parse_movenet_output(&data).expect("pose");
+        let wrist = pose.keypoints[kp::LEFT_WRIST];
+        assert!((wrist.y - 0.09).abs() < 1e-6);
+        assert!((wrist.x - 0.59).abs() < 1e-6);
+        assert!((wrist.score - 0.9).abs() < 1e-6);
     }
 
     #[test]
-    fn identical_frames_produce_no_events() {
-        let frames = vec![frame_with_block(30); 60];
-        assert!(run(&frames).is_empty());
+    fn short_output_is_rejected() {
+        assert!(parse_movenet_output(&[0.0; 10]).is_none());
     }
 
     #[test]
-    fn single_jump_on_the_left_is_moving_then_still() {
-        let mut frames = vec![frame_with_block(2); 10];
-        frames.extend(vec![frame_with_block(10); 60]);
-        let events = run(&frames);
-        assert_eq!(events.len(), 2, "events: {:?}", events);
-        assert_eq!(events[0].action, Action::Moving);
-        assert_eq!(events[0].zone, Some(Zone::Left));
-        assert_eq!(events[1].action, Action::Still);
+    fn planar_layout_groups_channels() {
+        // Two pixels: (1,2,3) and (4,5,6) -> planes [1,4], [2,5], [3,6]
+        let planar = to_planar(&[1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(planar, vec![1, 4, 2, 5, 3, 6]);
     }
 
     #[test]
-    fn side_to_side_motion_is_waving() {
-        let mut frames: Vec<GrayFrame> = (0..90)
-            .map(|i| {
-                let t = i as f64 / FPS;
-                frame_with_block((40.0 + 20.0 * (2.0 * PI * 2.5 * t).sin()) as i32)
-            })
-            .collect();
-        frames.extend(vec![frame_with_block(40); 40]);
-        let events = run(&frames);
-        assert!(
-            events.iter().any(|e| e.action == Action::Waving),
-            "events: {:?}",
-            events
-        );
-        assert_eq!(events.last().map(|e| e.action), Some(Action::Still));
-    }
-
-    #[test]
-    fn one_way_walk_is_not_waving() {
-        let mut frames: Vec<GrayFrame> = (0..18).map(|i| frame_with_block(2 + 4 * i)).collect();
-        frames.extend(vec![frame_with_block(70); 60]);
-        let events = run(&frames);
-        assert!(!events.is_empty());
-        assert!(events.iter().all(|e| e.action != Action::Waving));
-    }
-
-    #[test]
-    fn slow_sway_is_ignored() {
-        let frames: Vec<GrayFrame> = (0..150)
-            .map(|i| {
-                let t = i as f64 / FPS;
-                frame_with_block((40.0 + 20.0 * (2.0 * PI * 0.3 * t).sin()) as i32)
-            })
-            .collect();
-        assert!(run(&frames).is_empty());
-    }
-
-    #[test]
-    fn small_sensor_noise_is_ignored() {
-        // Deterministic pseudo-random noise of +/- 4 levels (below the threshold).
-        let mut seed: u32 = 12345;
-        let frames: Vec<GrayFrame> = (0..120)
-            .map(|_| {
-                let data: Vec<u8> = (0..W * H)
-                    .map(|_| {
-                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                        let n = ((seed >> 24) % 9) as i32 - 4;
-                        (100 + n) as u8
-                    })
-                    .collect();
-                GrayFrame::new(W, H, data)
-            })
-            .collect();
-        assert!(run(&frames).is_empty());
-    }
-
-    #[test]
-    fn whole_image_brightness_flicker_is_ignored() {
-        let frames: Vec<GrayFrame> = (0..90)
-            .map(|i| GrayFrame::filled(W, H, if i % 7 == 0 { 160 } else { 100 }))
-            .collect();
-        assert!(run(&frames).is_empty());
+    fn long_error_messages_are_shortened() {
+        let long = "word ".repeat(200);
+        assert!(shorten(&long).chars().count() <= 245);
+        assert_eq!(shorten("a\n  b"), "a b");
     }
 }
