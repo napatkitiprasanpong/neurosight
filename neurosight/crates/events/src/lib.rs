@@ -21,8 +21,12 @@ use std::collections::VecDeque;
 
 use neurosight_common::{Action, Event, GrayFrame, Zone};
 
+mod head;
 mod pose;
+mod reach;
+pub use head::{HeadAnalyzer, HeadConfig, HeadDebug, HeadGesture};
 pub use pose::{PoseAnalyzer, PoseConfig, PoseDebug};
+pub use reach::{ReachConfig, ReachDetector};
 
 /// Tunable thresholds. The defaults are a starting point: expect to adjust
 /// them for your camera and lighting (run the app with `--debug`).
@@ -226,8 +230,8 @@ impl MotionAnalyzer {
                 Action::Still => 1.0,
                 Action::Moving => (ratio / 0.05).clamp(0.3, 1.0),
                 Action::Waving => (reversals as f32 / 8.0).clamp(0.5, 1.0),
-                // The motion analyzer never produces these (pose mode only).
-                Action::Appeared | Action::Present | Action::Left => 1.0,
+                // The motion analyzer only produces the three actions above.
+                _ => 1.0,
             };
             return Some(Event {
                 time_s: t,

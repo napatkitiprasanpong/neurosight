@@ -658,8 +658,10 @@ version = "0.1.0"
 dependencies = [
  "neurosight-capture",
  "neurosight-common",
+ "neurosight-encoder",
  "neurosight-events",
  "neurosight-perception",
+ "neurosight-receiver-sim",
 ]
 
 [[package]]
@@ -675,6 +677,13 @@ name = "neurosight-common"
 version = "0.1.0"
 
 [[package]]
+name = "neurosight-encoder"
+version = "0.1.0"
+dependencies = [
+ "neurosight-common",
+]
+
+[[package]]
 name = "neurosight-events"
 version = "0.1.0"
 dependencies = [
@@ -687,6 +696,13 @@ version = "0.1.0"
 dependencies = [
  "neurosight-common",
  "ort",
+]
+
+[[package]]
+name = "neurosight-receiver-sim"
+version = "0.1.0"
+dependencies = [
+ "neurosight-common",
 ]
 
 [[package]]

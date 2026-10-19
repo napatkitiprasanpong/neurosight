@@ -5,6 +5,8 @@ members = [
     "crates/capture",
     "crates/perception",
     "crates/events",
+    "crates/encoder",
+    "crates/receiver-sim",
     "crates/app",
 ]
 

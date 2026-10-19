@@ -13,3 +13,5 @@ neurosight-common = { path = "../common" }
 neurosight-capture = { path = "../capture" }
 neurosight-events = { path = "../events" }
 neurosight-perception = { path = "../perception" }
+neurosight-encoder = { path = "../encoder" }
+neurosight-receiver-sim = { path = "../receiver-sim" }

@@ -241,6 +241,13 @@ pub enum Action {
     Appeared,
     Present,
     Left,
+    ReachingOut,
+    LookedLeft,
+    LookedRight,
+    LookedUp,
+    LookedDown,
+    Nodding,
+    ShakingHead,
     // Both modes
     Waving,
 }
@@ -253,6 +260,13 @@ impl fmt::Display for Action {
             Action::Appeared => "appeared",
             Action::Present => "present",
             Action::Left => "left",
+            Action::ReachingOut => "reaching out",
+            Action::LookedLeft => "looked left",
+            Action::LookedRight => "looked right",
+            Action::LookedUp => "looked up",
+            Action::LookedDown => "looked down",
+            Action::Nodding => "nodding",
+            Action::ShakingHead => "shaking head",
             Action::Waving => "waving",
         };
         write!(f, "{}", s)
@@ -296,6 +310,20 @@ impl Event {
             Action::Appeared => format!("Someone appeared{}{}.", place, dist),
             Action::Present => format!("Someone is in view{}{}.", place, dist),
             Action::Left => "The person left.".to_string(),
+            Action::ReachingOut => format!(
+                "Someone is reaching out a hand (handshake offer){}{}.",
+                place, dist
+            ),
+            Action::LookedLeft => {
+                "Someone turned their head toward the left of the image.".to_string()
+            }
+            Action::LookedRight => {
+                "Someone turned their head toward the right of the image.".to_string()
+            }
+            Action::LookedUp => "Someone is looking up.".to_string(),
+            Action::LookedDown => "Someone is looking down.".to_string(),
+            Action::Nodding => "Someone is nodding (yes).".to_string(),
+            Action::ShakingHead => "Someone is shaking their head (no).".to_string(),
             Action::Waving => {
                 let target = if self.facing_camera { " at you" } else { "" };
                 format!(
@@ -304,6 +332,75 @@ impl Event {
                 )
             }
         }
+    }
+}
+
+// ---------------------------------------------- stimulation (simulation only)
+//
+// These types describe an ABSTRACT stimulation pattern for a SIMULATION. They have no
+// physical units (no tesla, joules or amperes) and nothing in this project sends them to a
+// device. Real brain stimulation needs medical screening and clinical supervision.
+
+/// Side length of the virtual coil grid and of the phosphene grid (GRID x GRID cells).
+pub const GRID: u8 = 5;
+
+/// Position of a virtual coil over the back of the head, seen from behind.
+/// `col` 0 = the person's left side ... `col` 4 = the person's right side.
+/// `row` 0 = highest on the head ... `row` 4 = lowest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoilPos {
+    pub col: u8,
+    pub row: u8,
+}
+
+/// One magnetic pulse of a pattern.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pulse {
+    /// Milliseconds after the start of the pattern.
+    pub offset_ms: u32,
+    pub coil: CoilPos,
+    /// Relative strength: 1.0 = the simulated phosphene threshold.
+    pub intensity: f32,
+}
+
+/// A short sequence of pulses that stands for one event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pattern {
+    pub name: &'static str,
+    pub action: Action,
+    pub pulses: Vec<Pulse>,
+}
+
+impl Pattern {
+    /// Time of the last pulse, in milliseconds.
+    pub fn duration_ms(&self) -> u32 {
+        self.pulses.iter().map(|p| p.offset_ms).max().unwrap_or(0)
+    }
+}
+
+/// How the virtual coil grid relates to the visual field (very simplified).
+///
+/// Each half of the visual cortex handles the opposite half of the visual field, and the
+/// upper visual field is handled by the lower part of the visual cortex. So a phosphene in
+/// the LEFT visual field is made by a coil on the RIGHT side of the head, and a phosphene
+/// in the UPPER visual field by a coil LOW on the head.
+pub mod retinotopy {
+    use super::{CoilPos, GRID};
+
+    /// Phosphene cell (col 0 = far left of the visual field, row 0 = top) -> coil position.
+    pub fn coil_for_phosphene(col: u8, row: u8) -> CoilPos {
+        CoilPos {
+            col: GRID - 1 - col.min(GRID - 1),
+            row: GRID - 1 - row.min(GRID - 1),
+        }
+    }
+
+    /// Coil position -> phosphene cell (col, row) in the visual field.
+    pub fn phosphene_for_coil(coil: CoilPos) -> (u8, u8) {
+        (
+            GRID - 1 - coil.col.min(GRID - 1),
+            GRID - 1 - coil.row.min(GRID - 1),
+        )
     }
 }
 
@@ -366,6 +463,57 @@ mod tests {
         assert!(text.contains("waving at you"));
         assert!(text.contains("left"));
         assert!(text.contains("medium"));
+    }
+
+    #[test]
+    fn head_gesture_texts() {
+        let mk = |action| Event {
+            time_s: 0.0,
+            action,
+            zone: None,
+            distance: None,
+            facing_camera: true,
+            confidence: 0.8,
+        };
+        assert!(mk(Action::Nodding).to_text().contains("nodding"));
+        assert!(mk(Action::ShakingHead).to_text().contains("shaking"));
+        assert!(mk(Action::LookedUp).to_text().contains("up"));
+        assert!(mk(Action::LookedDown).to_text().contains("down"));
+        assert!(mk(Action::LookedLeft).to_text().contains("left"));
+        assert!(mk(Action::LookedRight).to_text().contains("right"));
+        assert!(mk(Action::ReachingOut).to_text().contains("handshake"));
+    }
+
+    #[test]
+    fn retinotopy_is_crossed_and_flipped() {
+        // Far left of the visual field -> coil on the right side of the head.
+        let c = retinotopy::coil_for_phosphene(0, 2);
+        assert_eq!(c.col, GRID - 1);
+        // Top of the visual field -> coil low on the head.
+        let c = retinotopy::coil_for_phosphene(2, 0);
+        assert_eq!(c.row, GRID - 1);
+        // And back again.
+        for col in 0..GRID {
+            for row in 0..GRID {
+                let coil = retinotopy::coil_for_phosphene(col, row);
+                assert_eq!(retinotopy::phosphene_for_coil(coil), (col, row));
+            }
+        }
+    }
+
+    #[test]
+    fn pattern_duration_is_last_pulse_time() {
+        let pulse = |ms| Pulse {
+            offset_ms: ms,
+            coil: CoilPos { col: 0, row: 0 },
+            intensity: 1.0,
+        };
+        let p = Pattern {
+            name: "t",
+            action: Action::Waving,
+            pulses: vec![pulse(0), pulse(200), pulse(400)],
+        };
+        assert_eq!(p.duration_ms(), 400);
     }
 
     #[test]

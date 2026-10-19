@@ -1,0 +1,8 @@
+[package]
+name = "neurosight-encoder"
+version.workspace = true
+edition.workspace = true
+description = "Turns NeuroSight events into abstract stimulation patterns (simulation only)"
+
+[dependencies]
+neurosight-common = { path = "../common" }

@@ -13,11 +13,19 @@
 //!   a hand-wave frequency (about 1-6 Hz).
 //! * The swing is still going on in the last half second (so "stopped waving"
 //!   is noticed quickly).
+//!
+//! Other upper-body gestures come from two helpers:
+//!
+//! * `HeadAnalyzer` (head.rs): turning the head left / right, looking up / down,
+//!   nodding and shaking the head.
+//! * `ReachDetector` (reach.rs): holding a hand out toward the camera (handshake offer).
 
 use std::collections::VecDeque;
 
 use neurosight_common::{kp, Action, Distance, Event, Pose, Zone};
 
+use crate::head::{HeadAnalyzer, HeadConfig, HeadGesture};
+use crate::reach::{ReachConfig, ReachDetector};
 use crate::{count_reversals, smooth3};
 
 /// Tunable thresholds. The defaults are a starting point.
@@ -52,6 +60,13 @@ pub struct PoseConfig {
     pub near_span: f32,
     /// ...and below which the person is far.
     pub far_span: f32,
+    /// Width divided by height of the camera image (the program updates this from the
+    /// real camera). Needed to measure lengths correctly.
+    pub image_aspect: f32,
+    /// Settings for head gestures.
+    pub head: HeadConfig,
+    /// Settings for the hand-held-out (handshake offer) pose.
+    pub reach: ReachConfig,
 }
 
 impl Default for PoseConfig {
@@ -72,6 +87,9 @@ impl Default for PoseConfig {
             recent_motion_s: 0.5,
             near_span: 0.30,
             far_span: 0.15,
+            image_aspect: 4.0 / 3.0,
+            head: HeadConfig::default(),
+            reach: ReachConfig::default(),
         }
     }
 }
@@ -85,6 +103,11 @@ pub struct PoseDebug {
     pub right_raised: bool,
     pub left_reversals: usize,
     pub right_reversals: usize,
+    /// Head offset from its neutral position, in shoulder widths.
+    pub head_dx: f32,
+    pub head_dy: f32,
+    pub shake_reversals: usize,
+    pub nod_reversals: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +120,7 @@ struct WristSample {
 #[derive(Clone, Copy, Debug)]
 struct PersonInfo {
     mid_x: f32,
+    mid_y: f32,
     span: f32,
     facing: bool,
 }
@@ -110,11 +134,19 @@ pub struct PoseAnalyzer {
     last_wave_t: f64,
     /// Index 0 = left wrist, 1 = right wrist.
     tracks: [VecDeque<WristSample>; 2],
+    head: HeadAnalyzer,
+    reach: ReachDetector,
+    /// Events found but not yet handed out (one is returned per `process` call).
+    pending: VecDeque<Event>,
+    aspect: f32,
     debug: PoseDebug,
 }
 
 impl PoseAnalyzer {
     pub fn new(cfg: PoseConfig) -> Self {
+        let head = HeadAnalyzer::new(cfg.head.clone());
+        let reach = ReachDetector::new(cfg.reach.clone());
+        let aspect = cfg.image_aspect;
         Self {
             cfg,
             present: false,
@@ -123,6 +155,10 @@ impl PoseAnalyzer {
             waving: false,
             last_wave_t: f64::NEG_INFINITY,
             tracks: [VecDeque::new(), VecDeque::new()],
+            head,
+            reach,
+            pending: VecDeque::new(),
+            aspect,
             debug: PoseDebug::default(),
         }
     }
@@ -131,9 +167,24 @@ impl PoseAnalyzer {
         self.debug
     }
 
+    /// Tell the analyzer the camera image shape (width / height).
+    pub fn set_aspect(&mut self, aspect: f32) {
+        if aspect > 0.1 {
+            self.aspect = aspect;
+        }
+    }
+
     /// Feed the pose for one frame (None if the model found nobody).
-    /// Returns an event only when something worth announcing changes.
+    /// Returns an event only when something worth announcing changes. If several
+    /// things happen at the same moment, the extra events come out on the next calls.
     pub fn process(&mut self, pose: Option<&Pose>, t: f64) -> Option<Event> {
+        if let Some(event) = self.step(pose, t) {
+            self.pending.push_back(event);
+        }
+        self.pending.pop_front()
+    }
+
+    fn step(&mut self, pose: Option<&Pose>, t: f64) -> Option<Event> {
         let info = pose.and_then(|p| self.person_info(p));
 
         if info.is_some() {
@@ -163,6 +214,8 @@ impl PoseAnalyzer {
             for track in self.tracks.iter_mut() {
                 track.clear();
             }
+            self.head.reset();
+            self.reach.reset();
             return Some(Event {
                 time_s: t,
                 action: Action::Left,
@@ -177,6 +230,52 @@ impl PoseAnalyzer {
             (true, Some(i), Some(p)) => (i, p),
             _ => return None,
         };
+
+        // Head gestures (need the nose) and the hand-held-out pose.
+        let shoulder_w = info.span * self.aspect;
+        let nose = pose.keypoints[kp::NOSE];
+        if nose.score >= self.cfg.min_score {
+            let hx = (nose.x - info.mid_x) / info.span;
+            let hy = (nose.y - info.mid_y) / shoulder_w;
+            if let Some(gesture) = self.head.process(hx, hy, t) {
+                let action = match gesture {
+                    HeadGesture::Nodding => Action::Nodding,
+                    HeadGesture::ShakingHead => Action::ShakingHead,
+                    HeadGesture::TurnedLeft => Action::LookedLeft,
+                    HeadGesture::TurnedRight => Action::LookedRight,
+                    HeadGesture::LookedUp => Action::LookedUp,
+                    HeadGesture::LookedDown => Action::LookedDown,
+                };
+                let event = self.make_event(t, action, info, 0.8);
+                self.pending.push_back(event);
+            }
+            let hd = self.head.debug();
+            self.debug.head_dx = hd.dx;
+            self.debug.head_dy = hd.dy;
+            self.debug.shake_reversals = hd.shake_reversals;
+            self.debug.nod_reversals = hd.nod_reversals;
+        }
+        let reached = self.reach.process(
+            [
+                pose.keypoints[kp::LEFT_SHOULDER],
+                pose.keypoints[kp::RIGHT_SHOULDER],
+            ],
+            [
+                pose.keypoints[kp::LEFT_ELBOW],
+                pose.keypoints[kp::RIGHT_ELBOW],
+            ],
+            [
+                pose.keypoints[kp::LEFT_WRIST],
+                pose.keypoints[kp::RIGHT_WRIST],
+            ],
+            self.aspect,
+            shoulder_w,
+            t,
+        );
+        if reached {
+            let event = self.make_event(t, Action::ReachingOut, info, 0.8);
+            self.pending.push_back(event);
+        }
 
         // Record where each wrist is (relative to the shoulders).
         let pairs = [
@@ -245,6 +344,7 @@ impl PoseAnalyzer {
             && right_eye.score >= self.cfg.min_score;
         Some(PersonInfo {
             mid_x: (ls.x + rs.x) / 2.0,
+            mid_y: (ls.y + rs.y) / 2.0,
             span,
             facing,
         })
@@ -475,6 +575,74 @@ mod tests {
         k[kp::RIGHT_EYE].score = 0.1;
         let events = run(&vec![Some(Pose::new(k)); 10]);
         assert!(!events[0].facing_camera);
+    }
+
+    /// Standing person whose nose is placed for the given head yaw / pitch (degrees).
+    fn pose_with_head(yaw_deg: f64, pitch_deg: f64) -> Option<Pose> {
+        let (hx, hy) = crate::head::tests::nose_offset(yaw_deg, pitch_deg);
+        let mut k = base_keypoints();
+        let span = 0.2_f32; // shoulders at x = 0.4 and 0.6
+        let shoulder_w = span * 4.0 / 3.0;
+        k[kp::NOSE] = kpt(0.5 + hx * span, 0.4 + hy * shoulder_w, 0.9);
+        Some(Pose::new(k))
+    }
+
+    #[test]
+    fn shaking_head_is_reported_through_the_pose_analyzer() {
+        let mut poses: Vec<Option<Pose>> = vec![pose_with_head(0.0, 0.0); 30];
+        poses.extend((0..120).map(|i| pose_with_head(30.0 * (2.0 * PI * 2.0 * i as f64 / FPS).sin(), 0.0)));
+        let events = run(&poses);
+        assert_eq!(
+            actions(&events),
+            vec![Action::Appeared, Action::ShakingHead],
+            "events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn nodding_head_is_reported_through_the_pose_analyzer() {
+        let mut poses: Vec<Option<Pose>> = vec![pose_with_head(0.0, 0.0); 30];
+        poses.extend((0..120).map(|i| pose_with_head(0.0, 12.0 * (2.0 * PI * 2.0 * i as f64 / FPS).sin())));
+        let events = run(&poses);
+        assert_eq!(
+            actions(&events),
+            vec![Action::Appeared, Action::Nodding],
+            "events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn turning_and_looking_are_reported_through_the_pose_analyzer() {
+        let mut poses: Vec<Option<Pose>> = vec![pose_with_head(0.0, 0.0); 30];
+        poses.extend(vec![pose_with_head(50.0, 0.0); 45]); // turn toward image right
+        poses.extend(vec![pose_with_head(0.0, 0.0); 45]);
+        poses.extend(vec![pose_with_head(0.0, -25.0); 45]); // look up
+        poses.extend(vec![pose_with_head(0.0, 0.0); 45]);
+        let events = run(&poses);
+        assert_eq!(
+            actions(&events),
+            vec![Action::Appeared, Action::LookedRight, Action::LookedUp],
+            "events: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn hand_held_out_is_reported_through_the_pose_analyzer() {
+        let shoulder_w = 0.2_f32 * 4.0 / 3.0;
+        let mut k = base_keypoints();
+        // Right arm (person's right = image left): upper arm down, forearm toward the camera.
+        k[kp::RIGHT_ELBOW] = kpt(0.4 + 0.05 * 0.2, 0.4 + 0.6 * shoulder_w, 0.9);
+        k[kp::RIGHT_WRIST] = kpt(0.4 + 0.03 * 0.2, 0.4 + 0.55 * shoulder_w, 0.9);
+        let events = run(&vec![Some(Pose::new(k)); 60]);
+        assert_eq!(
+            actions(&events),
+            vec![Action::Appeared, Action::ReachingOut],
+            "events: {:?}",
+            events
+        );
     }
 
     #[test]

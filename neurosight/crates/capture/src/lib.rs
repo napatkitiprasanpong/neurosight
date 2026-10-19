@@ -32,6 +32,8 @@ pub struct Captured {
     pub gray: GrayFrame,
     /// Square color image for the pose model (the camera image is squeezed to fit).
     pub rgb: RgbFrame,
+    /// Width divided by height of the original camera image (for example 1.33 for 640x480).
+    pub aspect: f32,
 }
 
 pub struct WebcamSource {
@@ -72,6 +74,7 @@ impl WebcamSource {
         Ok(Captured {
             gray: GrayFrame::from_rgb_downscaled(raw, w, h, self.gray_w, self.gray_h),
             rgb: RgbFrame::from_rgb_downscaled(raw, w, h, self.rgb_size, self.rgb_size),
+            aspect: w as f32 / h.max(1) as f32,
         })
     }
 }

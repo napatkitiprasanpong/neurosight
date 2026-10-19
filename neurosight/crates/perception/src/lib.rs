@@ -1,8 +1,13 @@
 //! Pose estimation with MoveNet SinglePose (Lightning or Thunder) through ONNX Runtime.
 //!
-//! Expected model (as exported from TensorFlow Hub with tf2onnx):
-//!   input : [1, size, size, 3]  RGB, values 0-255, NHWC, int32 (float32 also accepted)
-//!   output: [1, 1, 17, 3]       per keypoint: y, x, confidence (all 0.0-1.0)
+//! Expected model (as exported from TensorFlow Hub):
+//!   input : a square RGB image, values 0-255, as [1, size, size, 3] (NHWC) or
+//!           [1, 3, size, size] (NCHW), integer or float
+//!   output: [1, 1, 17, 3]  per keypoint: y, x, confidence (all 0.0-1.0)
+//!
+//! Exports differ, so `load` tries the four combinations (NHWC int32, NHWC float32,
+//! NCHW float32, NCHW int32) with a blank test image and remembers the first that works.
+//! If none works, the error lists what the model said about each attempt.
 //!
 //! See `models/README.md` for how to get the model file.
 
@@ -32,10 +37,55 @@ fn err<E: fmt::Display>(e: E) -> PerceptionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputKind {
+enum Layout {
+    /// [1, height, width, 3]
+    Nhwc,
+    /// [1, 3, height, width]
+    Nchw,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dtype {
     Int32,
     Float32,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputKind {
+    layout: Layout,
+    dtype: Dtype,
+}
+
+impl InputKind {
+    fn label(&self) -> &'static str {
+        match (self.layout, self.dtype) {
+            (Layout::Nhwc, Dtype::Int32) => "NHWC int32",
+            (Layout::Nhwc, Dtype::Float32) => "NHWC float32",
+            (Layout::Nchw, Dtype::Int32) => "NCHW int32",
+            (Layout::Nchw, Dtype::Float32) => "NCHW float32",
+        }
+    }
+}
+
+/// The input formats to try, most likely first.
+const CANDIDATES: [InputKind; 4] = [
+    InputKind {
+        layout: Layout::Nhwc,
+        dtype: Dtype::Int32,
+    },
+    InputKind {
+        layout: Layout::Nhwc,
+        dtype: Dtype::Float32,
+    },
+    InputKind {
+        layout: Layout::Nchw,
+        dtype: Dtype::Float32,
+    },
+    InputKind {
+        layout: Layout::Nchw,
+        dtype: Dtype::Int32,
+    },
+];
 
 pub struct PoseEstimator {
     session: Session,
@@ -51,28 +101,31 @@ impl PoseEstimator {
             .commit_from_file(model_path.as_ref())
             .map_err(err)?;
 
-        // Some exports want int32 input, some float32. Try int32 first, then float32,
-        // using a blank test image, and remember which one works.
+        // Find out which input format the model accepts, using a blank test image.
         let blank = vec![0u8; input_size * input_size * 3];
-        let (kind, out) = match run_raw(&mut session, InputKind::Int32, input_size, &blank) {
-            Ok(out) => (InputKind::Int32, out),
-            Err(int_err) => match run_raw(&mut session, InputKind::Float32, input_size, &blank) {
-                Ok(out) => (InputKind::Float32, out),
-                Err(float_err) => {
-                    return Err(PerceptionError(format!(
-                        "the model rejected both int32 input ({}) and float32 input ({})",
-                        int_err.0, float_err.0
-                    )))
+        let mut failures: Vec<String> = Vec::new();
+        let mut chosen: Option<InputKind> = None;
+        for kind in CANDIDATES {
+            match run_raw(&mut session, kind, input_size, &blank) {
+                Ok(out) if out.len() >= KEYPOINT_COUNT * 3 => {
+                    chosen = Some(kind);
+                    break;
                 }
-            },
-        };
-        if out.len() < KEYPOINT_COUNT * 3 {
-            return Err(PerceptionError(format!(
-                "unexpected output size {} (expected at least {} = 17 keypoints x 3 numbers)",
-                out.len(),
-                KEYPOINT_COUNT * 3
-            )));
+                Ok(out) => failures.push(format!(
+                    "{}: ran, but the output has {} numbers (expected at least {})",
+                    kind.label(),
+                    out.len(),
+                    KEYPOINT_COUNT * 3
+                )),
+                Err(e) => failures.push(format!("{}: {}", kind.label(), shorten(&e.0))),
+            }
         }
+        let kind = chosen.ok_or_else(|| {
+            PerceptionError(format!(
+                "the model did not accept any input format I know. What it said: {}",
+                failures.join(" | ")
+            ))
+        })?;
 
         Ok(Self {
             session,
@@ -83,6 +136,11 @@ impl PoseEstimator {
 
     pub fn input_size(&self) -> usize {
         self.size
+    }
+
+    /// For example "NHWC int32" (shown in the start-up message).
+    pub fn input_description(&self) -> &'static str {
+        self.kind.label()
     }
 
     /// Estimate the pose in a square RGB frame of exactly `input_size` x `input_size`.
@@ -100,6 +158,27 @@ impl PoseEstimator {
     }
 }
 
+fn shorten(message: &str) -> String {
+    let one_line: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 240 {
+        let cut: String = one_line.chars().take(240).collect();
+        format!("{}...", cut)
+    } else {
+        one_line
+    }
+}
+
+/// Rearrange packed RGB (R,G,B,R,G,B,...) into planes (all R, then all G, then all B).
+fn to_planar(rgb: &[u8], pixels: usize) -> Vec<u8> {
+    let mut planar = Vec::with_capacity(pixels * 3);
+    for channel in 0..3 {
+        for i in 0..pixels {
+            planar.push(rgb[i * 3 + channel]);
+        }
+    }
+    planar
+}
+
 /// Run the model once and return the flat output numbers.
 fn run_raw(
     session: &mut Session,
@@ -107,15 +186,18 @@ fn run_raw(
     size: usize,
     rgb: &[u8],
 ) -> Result<Vec<f32>, PerceptionError> {
-    let shape = [1usize, size, size, 3];
-    let outputs = match kind {
-        InputKind::Int32 => {
-            let data: Vec<i32> = rgb.iter().map(|&v| v as i32).collect();
+    let (shape, bytes): ([usize; 4], Vec<u8>) = match kind.layout {
+        Layout::Nhwc => ([1, size, size, 3], rgb.to_vec()),
+        Layout::Nchw => ([1, 3, size, size], to_planar(rgb, size * size)),
+    };
+    let outputs = match kind.dtype {
+        Dtype::Int32 => {
+            let data: Vec<i32> = bytes.iter().map(|&v| v as i32).collect();
             let tensor = Tensor::from_array((shape, data)).map_err(err)?;
             session.run(ort::inputs![tensor]).map_err(err)?
         }
-        InputKind::Float32 => {
-            let data: Vec<f32> = rgb.iter().map(|&v| v as f32).collect();
+        Dtype::Float32 => {
+            let data: Vec<f32> = bytes.iter().map(|&v| v as f32).collect();
             let tensor = Tensor::from_array((shape, data)).map_err(err)?;
             session.run(ort::inputs![tensor]).map_err(err)?
         }
@@ -164,5 +246,19 @@ mod tests {
     #[test]
     fn short_output_is_rejected() {
         assert!(parse_movenet_output(&[0.0; 10]).is_none());
+    }
+
+    #[test]
+    fn planar_layout_groups_channels() {
+        // Two pixels: (1,2,3) and (4,5,6) -> planes [1,4], [2,5], [3,6]
+        let planar = to_planar(&[1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(planar, vec![1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn long_error_messages_are_shortened() {
+        let long = "word ".repeat(200);
+        assert!(shorten(&long).chars().count() <= 245);
+        assert_eq!(shorten("a\n  b"), "a b");
     }
 }

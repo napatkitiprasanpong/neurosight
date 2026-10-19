@@ -27,6 +27,27 @@ finds the person's shoulders, elbows and wrists. A raised hand swinging left and
 [   9.10s] The person left.
 ```
 
+Pose mode recognizes these upper-body gestures:
+
+| Gesture | Event text | How it is detected |
+|---|---|---|
+| Appearing / leaving | "Someone appeared ...", "The person left." | shoulders seen for 3 frames / missing for 1 s |
+| Waving | "Someone is waving at you ..." | raised hand swinging left-right, 1-6 Hz |
+| Handshake offer | "Someone is reaching out a hand (handshake offer) ..." | upper arm down, forearm pointing at the camera (looks short), wrist at chest-to-waist height, held still for 0.6 s |
+| Turning the head | "Someone turned their head toward the left / right of the image." | nose moves sideways relative to the shoulders |
+| Looking up / down | "Someone is looking up." / "... looking down." | nose moves up / down relative to the shoulders |
+| Nodding (yes) | "Someone is nodding (yes)." | nose swings up and down several times |
+| Shaking head (no) | "Someone is shaking their head (no)." | nose swings left and right several times |
+
+Head turns are described from the camera's point of view ("toward the left of the image"),
+like the side-of-image text for people. Head gestures are measured from the nose relative to the
+shoulders and compared with a neutral head position that the program learns during the first half
+second, so start by looking at the camera. Sit reasonably close (shoulders at least a third of the
+image width): from far away the nose moves only a few pixels and camera jitter can look like a nod.
+
+The handshake detector only sees the "hand held out toward the camera" pose. It cannot see a real
+handshake between two people (it follows one person).
+
 **Motion-only mode** (no model needed, used automatically if the model is missing): compares
 frames and treats a fast left-right swing of the motion as a wave.
 
@@ -35,6 +56,20 @@ frames and treats a fast left-right swing of the motion as a wave.
 [   4.00s] Someone is waving on the left of the image (confidence 75%).
 [   6.90s] Nothing is moving.
 ```
+
+**Which mode am I in?** The first lines printed say so. `POSE MODE: model ...` means the pose model
+loaded. A block starting with `*** MOTION-ONLY MODE: ...` means it did not, and gives the reason
+(model file not found, with the folders searched, or the exact message from the model loader). In
+motion-only mode only still / moving / waving exist; head turns, looking up/down, nodding,
+shaking and the handshake offer need pose mode. The debug lines also differ: `state=... motion=...`
+is motion-only mode, `person=... head_offset(x/y)=...` is pose mode.
+
+The model is looked for in `models/` (next to the project and in the current folder) as
+`movenet_lightning.onnx`, `model.onnx` or `movenet.onnx`, then any `.onnx` file there. It tries four
+input layouts (NHWC / NCHW, int32 / float32) and prints which one worked.
+
+Stimulation patterns that wait more than 2 seconds are dropped (they describe something that is
+over), and a newer pattern of the same kind replaces an older waiting one.
 
 Requirements: Rust (https://rustup.rs, keep it up to date with `rustup update`) and a webcam.
 The first build downloads ONNX Runtime (internet needed). On Linux the camera backend needs
@@ -49,16 +84,52 @@ cargo run --release -p neurosight-app -- --camera 1
 ```
 
 If waving is missed or false alarms appear, run with `--debug` and adjust the thresholds in
-`crates/events/src/lib.rs` (`Config::default`, motion mode) or `crates/events/src/pose.rs`
-(`PoseConfig::default`, pose mode).
+`crates/events/src/lib.rs` (`Config::default`, motion mode), `crates/events/src/pose.rs`
+(`PoseConfig::default`, waving), `head.rs` (`HeadConfig::default`) or `reach.rs`
+(`ReachConfig::default`).
 
-Current crates: `common`, `capture`, `perception`, `events`, `app`. The others in the layout
-below (`encoder`, `receiver-sim`) come in later weeks.
+Current crates: `common`, `capture`, `perception`, `events`, `encoder`, `receiver-sim`, `app`.
+
+### Stimulation (simulation only)
+
+Every event is also turned into an abstract magnetic-stimulation pattern and played on a
+simulated receiver that shows the flashes of light (phosphenes) a person would see:
+
+```
+[   1.60s] Someone is waving at you on the center of the image, at a medium distance (confidence 83%).
+[   1.63s]   stimulation pattern 'wave' (6 pulses, 1000 ms)
+[   1.63s]     pulse 1/6  coil (col 3, row 1)  intensity 1.15  ->  flash 5 deg up, 5 deg left, brightness 87%  [...../..@../...../...../.....]
+```
+
+- **Encoder** (`crates/encoder`): each event gets its own short pulse pattern. The patterns are
+  designed in the visual field: head events in the upper rows, arm events (wave, handshake offer)
+  in row 3, presence events (appeared, left) in row 4. The column follows where the person is in
+  the image and the strength follows how close they are.
+- **Retinotopy** (`crates/common`): converts a wanted phosphene spot into the virtual coil position
+  that would make it. Each half of the visual cortex handles the opposite half of the visual field
+  (a flash on the left needs a coil on the right side of the head), and the upper visual field is
+  handled by the lower part of the cortex. This is very simplified.
+- **Limits and scheduler:** patterns have at most 8 pulses, at least 100 ms apart, with a
+  strength cap, at least 2 seconds of rest between patterns, at most 12 patterns a minute, and a
+  small queue. These are abstract limits for the simulation, not medical safety guidance.
+- **Simulated receiver** (`crates/receiver-sim`): coil position -> visual-field spot, strength ->
+  brightness (50% at the simulated threshold of 1.0).
+- **Log:** `--log patterns.jsonl` appends every pattern as one line of JSON, for later analysis or
+  for the human recognition test.
+- `--no-stim` turns the stimulation simulation off.
+
+**This is simulation only.** The patterns have no physical units and nothing in the project sends
+anything to a device or a coil. Real brain stimulation, including TMS, needs medical screening and
+clinical supervision and can cause seizures, burns or hearing damage. Do not build or use a real
+device from this project.
 
 Notes on accuracy:
 - The camera image is squeezed to a square for the pose model. Left/right and up/down
   relationships are kept, which is all the wave logic uses.
 - "Facing the camera" is a rough guess (nose and both eyes are visible).
+- The gesture thresholds (head turn, nod, shake, handshake) were set against a simple simulated
+  head and arm, not real recordings. Expect to tune them with `--debug` (it prints head offsets
+  and direction-change counts); they are in `crates/events/src/head.rs` and `reach.rs`.
 - Distance is only near / medium / far, from the width of the shoulders in the image.
 - Pose mode follows one person (the one the model finds most clearly).
 

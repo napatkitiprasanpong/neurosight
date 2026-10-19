@@ -1,0 +1,8 @@
+[package]
+name = "neurosight-receiver-sim"
+version.workspace = true
+edition.workspace = true
+description = "Simulated receiver: shows the phosphenes a stimulation pattern would cause (simulation only)"
+
+[dependencies]
+neurosight-common = { path = "../common" }
