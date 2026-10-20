@@ -57,6 +57,25 @@ frames and treats a fast left-right swing of the motion as a wave.
 [   6.90s] Nothing is moving.
 ```
 
+**The window.** Everything is in one window. The camera picture is on the left, with the detected
+body points and lines drawn on it (head cyan, arms orange, torso green), the mode and state on top, the
+latest event as text at the bottom, and a small 5 x 5 grid ("seen") that lights up where the simulated
+stimulation would make a flash. The control panel on the right has buttons (or keys):
+
+| Button | Key | What it does |
+|---|---|---|
+| Camera ON / OFF | C | turns the camera off (the picture is replaced by a note) or back on |
+| Pose mode | P | body-pose model: waving, handshake offer, head gestures, appearing / leaving. Loads the model the first time; if it cannot load, the panel says why and the mode stays as it was |
+| Motion only | M | no model needed: still / moving / waving |
+| Stim ON / OFF | S | turns the simulated stimulation (patterns and flashes) on or off |
+| Mirror ON / OFF | R | flips the picture like a mirror; the text still uses the camera's own left and right |
+
+Esc (or closing the window) stops the program. If the camera cannot be opened at start-up, the window
+still opens (with the reason in the panel) so you can fix the problem and press the Camera button.
+Options: `--camera-off` starts with the camera off, `--motion` starts in motion-only mode,
+`--no-stim` starts with stimulation off, `--mirror` starts mirrored, `--no-window` is console only
+(no buttons).
+
 **Which mode am I in?** The first lines printed say so. `POSE MODE: model ...` means the pose model
 loaded. A block starting with `*** MOTION-ONLY MODE: ...` means it did not, and gives the reason
 (model file not found, with the folders searched, or the exact message from the model loader). In
@@ -81,6 +100,8 @@ cargo run --release -p neurosight-app              # pose mode if the model exis
 cargo run --release -p neurosight-app -- --motion  # force motion-only mode
 cargo run --release -p neurosight-app -- --debug   # also print numbers for tuning
 cargo run --release -p neurosight-app -- --camera 1
+cargo run --release -p neurosight-app -- --no-window   # console only (no buttons)
+cargo run --release -p neurosight-app -- --camera-off  # start with the camera off
 ```
 
 If waving is missed or false alarms appear, run with `--debug` and adjust the thresholds in

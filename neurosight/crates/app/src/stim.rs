@@ -8,7 +8,7 @@ use std::io::Write;
 
 use neurosight_common::Event;
 use neurosight_encoder::{encode, SafetyLimits, Scheduler};
-use neurosight_receiver_sim::{pattern_json, PhospheneModel, Player};
+use neurosight_receiver_sim::{pattern_json, Phosphene, PhospheneModel, Player};
 
 pub struct Stimulation {
     limits: SafetyLimits,
@@ -47,7 +47,8 @@ impl Stimulation {
     }
 
     /// Call on every frame: starts queued patterns when allowed and plays due pulses.
-    pub fn tick(&mut self, t: f64) {
+    /// Returns the latest flash of light if a pulse was played during this call.
+    pub fn tick(&mut self, t: f64) -> Option<Phosphene> {
         if let Some(pattern) = self.scheduler.poll(t) {
             println!(
                 "[{:7.2}s]   stimulation pattern '{}' ({} pulses, {} ms)",
@@ -64,8 +65,10 @@ impl Stimulation {
             }
             self.player.start(&pattern, t);
         }
+        let mut latest: Option<Phosphene> = None;
         for (number, total, pulse) in self.player.due(t) {
             let flash = self.model.percept(&pulse);
+            latest = Some(flash);
             println!(
                 "[{:7.2}s]     pulse {}/{}  coil (col {}, row {})  intensity {:.2}  ->  {}  [{}]",
                 t,
@@ -78,5 +81,6 @@ impl Stimulation {
                 flash.grid_inline()
             );
         }
+        latest
     }
 }

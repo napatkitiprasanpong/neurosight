@@ -15,3 +15,5 @@ neurosight-events = { path = "../events" }
 neurosight-perception = { path = "../perception" }
 neurosight-encoder = { path = "../encoder" }
 neurosight-receiver-sim = { path = "../receiver-sim" }
+minifb = "0.28"
+font8x8 = "0.3"

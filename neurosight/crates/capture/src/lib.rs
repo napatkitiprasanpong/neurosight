@@ -1,6 +1,6 @@
-//! Webcam capture: opens a camera and returns each frame twice:
-//! a small grayscale copy (for motion analysis) and a square color copy
-//! (for the pose model).
+//! Webcam capture: opens a camera and returns each frame three times:
+//! a small grayscale copy (for motion analysis), a square color copy (for the pose model)
+//! and a color copy with the original shape (for the camera window).
 
 use std::fmt;
 
@@ -34,6 +34,8 @@ pub struct Captured {
     pub rgb: RgbFrame,
     /// Width divided by height of the original camera image (for example 1.33 for 640x480).
     pub aspect: f32,
+    /// Color image with the original shape, for showing in a window.
+    pub preview: RgbFrame,
 }
 
 pub struct WebcamSource {
@@ -41,16 +43,19 @@ pub struct WebcamSource {
     gray_w: usize,
     gray_h: usize,
     rgb_size: usize,
+    preview_w: usize,
 }
 
 impl WebcamSource {
     /// Open camera number `index` (0 = default webcam).
-    /// `gray_w` x `gray_h` is the grayscale size; `rgb_size` is the side of the square color image.
+    /// `gray_w` x `gray_h` is the grayscale size; `rgb_size` is the side of the square color
+    /// image; `preview_w` is the width of the preview image (its height follows the camera shape).
     pub fn open(
         index: u32,
         gray_w: usize,
         gray_h: usize,
         rgb_size: usize,
+        preview_w: usize,
     ) -> Result<Self, CaptureError> {
         let requested = RequestedFormat::new::<RgbFormat>(
             RequestedFormatType::AbsoluteHighestFrameRate,
@@ -62,6 +67,7 @@ impl WebcamSource {
             gray_w,
             gray_h,
             rgb_size,
+            preview_w,
         })
     }
 
@@ -71,10 +77,13 @@ impl WebcamSource {
         let img = buffer.decode_image::<RgbFormat>()?;
         let (w, h) = (img.width() as usize, img.height() as usize);
         let raw = img.as_raw();
+        let aspect = w as f32 / h.max(1) as f32;
+        let preview_h = ((self.preview_w as f32 / aspect).round() as usize).max(1);
         Ok(Captured {
             gray: GrayFrame::from_rgb_downscaled(raw, w, h, self.gray_w, self.gray_h),
             rgb: RgbFrame::from_rgb_downscaled(raw, w, h, self.rgb_size, self.rgb_size),
-            aspect: w as f32 / h.max(1) as f32,
+            aspect,
+            preview: RgbFrame::from_rgb_downscaled(raw, w, h, self.preview_w, preview_h),
         })
     }
 }
