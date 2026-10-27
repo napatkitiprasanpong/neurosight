@@ -14,10 +14,14 @@ and gestures onto the forehead through touch.
 webcam -> perception -> event engine -> encoder -> simulated receiver -> (human recognition test)
 ```
 
+**Extension in progress (planned, not built yet):** an FPGA-based tactile output and smart-system
+integration, so the same events can be felt on a 5 x 5 grid of low-voltage vibration motors. See
+[FPGA extension](#fpga-extension-tactile-output-and-smart-system-integration-planned).
+
 Central research question: **how many different events can a person tell apart, and how fast can
 they learn them, from stimulation patterns alone?**
 
-See [TIMELINE.md](TIMELINE.md) for the 12-week plan.
+See [neurosight/TIMELINE.md](neurosight/TIMELINE.md) for the 12-week software plan.
 
 ## Status
 
@@ -28,8 +32,9 @@ See [TIMELINE.md](TIMELINE.md) for the 12-week plan.
 | Camera window and control panel (camera / mode / stim / mirror buttons) | newest addition; not yet confirmed on a real machine |
 | Gesture thresholds | set against a simulated head and arm, not real recordings: expect to tune them |
 | Human recognition test mode | not built yet |
-| CAD concept models of TMS equipment | built as non-functional shells, see [docs/cad](docs/cad/README.md) |
-| Hardware | none. Nothing in this project drives a coil or any other device |
+| CAD concept models of TMS equipment | built as non-functional shells, see `tms_wearable_concept.scad`, `make_tms_wearable.py`, `tms_wearable_concept.stl` |
+| FPGA tactile output (RTL, UART link, vibration grid) | **planned**, nothing written yet, see the FPGA section below |
+| Hardware | none yet. Nothing in this project drives a coil. The planned FPGA output drives only low-voltage vibration motors |
 
 ## Quick start
 
@@ -39,7 +44,7 @@ build downloads libraries, including ONNX Runtime, so it needs internet.
 1. **Get the pose model** (one time). Download `model.onnx` (about 9 MB, not the quantized
    versions) from
    https://huggingface.co/Xenova/movenet-singlepose-lightning/tree/main/onnx
-   and put it in the `models` folder. Other ways to get it are in [models/README.md](models/README.md).
+   and put it in the `models` folder. Other ways to get it are in [neurosight/models/README.md](neurosight/models/README.md).
    Without it the program still runs, but only in motion-only mode.
 2. **Run the tests** (no camera needed): `cargo test`
 3. **Start the program:** `cargo run --release -p neurosight-app`
@@ -164,14 +169,104 @@ receiver that shows the flash of light (phosphene) each pulse would cause:
   brightness (50% at the simulated threshold of 1.0).
 - **Log:** `--log patterns.jsonl` records every pattern, for analysis or for the human recognition test.
 
+## FPGA extension: tactile output and smart-system integration (planned)
+
+Status: **design only.** None of the items below exist in this repository yet. Each is marked
+with what is already available and what still has to be written.
+
+**Goal:** turn the simulated stimulation into a real, safe, low-power wearable. The encoder's
+5 x 5 patterns map directly onto a 5 x 5 grid of coin vibration motors (3 V), so the user feels
+the event instead of seeing a simulated flash. The FPGA takes over the parts that benefit from
+parallel, fixed-latency hardware and enforces the output limits in the circuit itself.
+
+```
+camera -> [FPGA] frame difference + wave detector --+
+PC (Rust: MoveNet, events) --UART--> [FPGA] event FSM -> pattern ROM -> safety scheduler
+ToF distance + IMU (I2C) -------------------------------+          -> 25-channel PWM
+                                                                      -> 74HC595 + ULN2803
+                                                                      -> 5 x 5 vibration grid
+power: 18650 -> 3.3 V, INA219 current/power monitor     status: UART log / display
+```
+
+### What stays in Rust, what moves to the FPGA
+
+| Function | Today (Rust) | Planned (FPGA) |
+|---|---|---|
+| Pose estimation (MoveNet) | `crates/perception` | stays on the PC |
+| Event engine (wave, nod, handshake offer ...) | `crates/events` | stays on the PC; the FPGA also runs a hardware motion/wave detector so it works without the PC |
+| Event -> pulse pattern | `crates/encoder` (`encode`) | pattern ROM generated from the Rust encoder |
+| Limits and scheduler | `SafetyLimits`, `Scheduler` | circuit: max 8 pulses, 100 ms gap, intensity cap, 2 s rest, 12 per minute, queue of 3, 2 s expiry |
+| Simulated receiver | `crates/receiver-sim` | replaced by the real vibration grid (the simulator stays as the reference) |
+
+### How the existing code maps to hardware
+
+- `Pulse { offset_ms, coil: CoilPos { col, row }, intensity }` -> one timed pulse on motor
+  `row * 5 + col` (GRID = 5, so 25 channels). `intensity` (0 to `max_intensity` 1.5) becomes a PWM duty.
+- `Action` (13 values), `Zone` (3) and `Distance` (3) fit in a few bits each, so an event is a very
+  short packet.
+- `--log patterns.jsonl` already writes every pattern; those lines are the **golden vectors** for
+  testing the RTL against the Rust behavior.
+
+### Draft event packet (UART, not final)
+
+| Byte | Field |
+|---|---|
+| 0 | start byte |
+| 1 | `Action` id (order of the enum in `crates/common`) |
+| 2 | `Zone` (left / center / right) |
+| 3 | `Distance` (near / medium / far); later replaced by the ToF reading |
+| 4 | confidence 0-100 |
+| 5 | checksum |
+
+### Verification plan
+
+1. Export patterns from the Rust encoder (`--log`) for every action, zone and distance.
+2. Simulate the RTL pattern ROM + scheduler with a testbench and compare against those lines,
+   pulse by pulse (time offset, motor index, PWM level).
+3. Assert the limits in the testbench (pulse count, 100 ms gap, 2 s rest, 12 per minute).
+4. Repeat on the real board with a logic analyzer.
+
+### Planned hardware (low voltage only)
+
+FPGA board (for example Sipeed Tang Primer 20K Dock), OV7670 camera, 25 coin vibration motors,
+74HC595 + ULN2803A output drivers, VL53L0X ToF distance sensor, MPU-6050 IMU, INA219 power
+monitor, USB-UART, and a 2 x 18650 battery pack with a 3.3 V regulator.
+
+### Target KPIs
+
+| KPI | Target |
+|---|---|
+| End-to-end latency, camera to vibration | at most 200 ms (median) |
+| Latency inside the FPGA, UART in to motor out | at most 1 ms |
+| Image pipeline frame rate | at least 25 fps |
+| Wave detection accuracy | at least 90% |
+| RTL matches the Rust reference | 100% of test vectors |
+| Human recognition of 5 tactile patterns | at least 80% |
+| Average power | at most 1.5 W |
+| Battery runtime | at least 6 h |
+| Output limits respected | no violations |
+
+### Roadmap
+
+- [ ] Freeze the event list (5 to 8) and the UART packet
+- [ ] Rust: golden-vector export for all events; tactile receiver and serial sender crate
+- [ ] RTL: UART receiver, pattern ROM, scheduler, 25-channel PWM, with testbenches
+- [ ] RTL: camera interface, frame differencing, wave detector
+- [ ] Board bring-up: camera, motor grid and drivers, ToF, IMU, INA219
+- [ ] Integration: PC + FPGA + sensors on battery
+- [ ] Measure the KPIs and run the human recognition test on the tactile grid
+
+Safety: the FPGA path drives **vibration motors at 3 V only**. The TMS-style pulses stay a
+software simulation and nothing in this project should be used to build real stimulation hardware.
+
 ## Scope and safety
 
-- **Simulation only.** The patterns have no physical units, and nothing in this project sends
-  anything to a device, a coil or any other hardware.
+- **TMS-style stimulation is simulation only.** The patterns have no physical units, and nothing in
+  this project sends them to a coil. The planned FPGA extension drives only low-voltage vibration motors.
 - Real brain stimulation, including TMS, needs medical screening and clinical supervision and can
   cause seizures, burns or hearing damage. Do not build or use a real device from this project. This
   project does not design stimulation electronics.
-- The CAD models in [docs/cad](docs/cad/README.md) are non-functional shells for visualization.
+- The CAD models (`tms_wearable_concept.scad`, `.stl`, `make_tms_wearable.py`) are non-functional shells for visualization.
 - A magnetic coil stimulates a patch about a centimeter across, so a real device could only make a
   few coarse flashes, not detailed images. That is why the patterns are small and simple.
 - Camera pictures stay on the local machine. Nothing is uploaded.
@@ -202,7 +297,9 @@ neurosight/
     receiver-sim/  simulated phosphenes, pattern player, JSON log lines
     app/           the program: engine, window (minifb), control panel, stimulation glue
   models/          ONNX model file (not included) and how to get it
-  docs/cad/        non-functional CAD concept models of TMS equipment
+  (planned) crates/tactile-link/   serial sender and golden-vector export for the FPGA
+  (planned) fpga/                  RTL, testbenches, constraints, board notes
+  (repo root)      tms_wearable_concept.scad / .stl / .png and make_tms_wearable.py: non-functional CAD shells
 ```
 
 Crates talk only through the types in `common`, so any stage can be swapped or rewritten without
@@ -215,7 +312,8 @@ scripts and, if needed, offline model conversion.
 2. Build the human recognition test: show only the simulated flashes and measure how well people
    tell the events apart (accuracy, reaction time, learning curve).
 3. Compare with a tactile output (a grid of small vibration motors on the forehead, like 7Sense).
-   Low-voltage and much safer to build; the 5 x 5 patterns already fit it.
+   Low-voltage and much safer to build; the 5 x 5 patterns already fit it. The FPGA extension above
+   is the plan for this step.
 4. Optional: a more realistic phosphene model (precomputed with SimNIBS / pulse2percept offline).
 
 ## Positioning
