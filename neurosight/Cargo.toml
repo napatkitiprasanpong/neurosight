@@ -7,6 +7,7 @@ members = [
     "crates/events",
     "crates/encoder",
     "crates/receiver-sim",
+    "crates/tactile-link",
     "crates/app",
 ]
 

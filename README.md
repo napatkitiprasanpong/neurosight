@@ -33,7 +33,8 @@ See [neurosight/TIMELINE.md](neurosight/TIMELINE.md) for the 12-week software pl
 | Gesture thresholds | set against a simulated head and arm, not real recordings: expect to tune them |
 | Human recognition test mode | not built yet |
 | CAD concept models of TMS equipment | built as non-functional shells, see `tms_wearable_concept.scad`, `make_tms_wearable.py`, `tms_wearable_concept.stl` |
-| FPGA tactile output (RTL, UART link, vibration grid) | **planned**, nothing written yet, see the FPGA section below |
+| FPGA tactile output: Rust side (`crates/tactile-link`: packet, pattern ROM, scheduler model, golden-vector export) | written, **not yet compiled or run**: run `cargo test -p neurosight-tactile-link` first |
+| FPGA tactile output: RTL, UART link on a real board, vibration grid | **planned**, nothing written yet, see the FPGA section below |
 | Hardware | none yet. Nothing in this project drives a coil. The planned FPGA output drives only low-voltage vibration motors |
 
 ## Quick start
@@ -207,20 +208,22 @@ power: 18650 -> 3.3 V, INA219 current/power monitor     status: UART log / displ
 - `--log patterns.jsonl` already writes every pattern; those lines are the **golden vectors** for
   testing the RTL against the Rust behavior.
 
-### Draft event packet (UART, not final)
+### Event packet (UART)
+
+Frozen in `docs/FPGA_SPEC.md` (stable ids, checksum, parser behaviour, scheduler rules, ROM format). Summary:
 
 | Byte | Field |
 |---|---|
 | 0 | start byte |
-| 1 | `Action` id (order of the enum in `crates/common`) |
+| 1 | action id 1 to 8 (stable table in `crates/tactile-link/src/wire.rs`, not the enum order) |
 | 2 | `Zone` (left / center / right) |
 | 3 | `Distance` (near / medium / far); later replaced by the ToF reading |
 | 4 | confidence 0-100 |
-| 5 | checksum |
+| 5 | checksum: XOR of bytes 1 to 4 |
 
 ### Verification plan
 
-1. Export patterns from the Rust encoder (`--log`) for every action, zone and distance.
+1. Export vectors from the Rust encoder and models: `cargo run -p neurosight-tactile-link --bin export-vectors -- fpga/vectors` (patterns, ROM image, packet streams, scheduler scenarios).
 2. Simulate the RTL pattern ROM + scheduler with a testbench and compare against those lines,
    pulse by pulse (time offset, motor index, PWM level).
 3. Assert the limits in the testbench (pulse count, 100 ms gap, 2 s rest, 12 per minute).
@@ -248,8 +251,8 @@ monitor, USB-UART, and a 2 x 18650 battery pack with a 3.3 V regulator.
 
 ### Roadmap
 
-- [ ] Freeze the event list (5 to 8) and the UART packet
-- [ ] Rust: golden-vector export for all events; tactile receiver and serial sender crate
+- [x] Freeze the event list (8 events) and the UART packet (proposal in `docs/FPGA_SPEC.md`; confirm or edit the `EVENTS` table)
+- [ ] Rust: `tactile-link` crate written (packet, ROM, scheduler model, vector export, optional serial sender); compile, test, then hook the sender into `app` and add a tactile 5 x 5 view
 - [ ] RTL: UART receiver, pattern ROM, scheduler, 25-channel PWM, with testbenches
 - [ ] RTL: camera interface, frame differencing, wave detector
 - [ ] Board bring-up: camera, motor grid and drivers, ToF, IMU, INA219
@@ -297,7 +300,7 @@ neurosight/
     receiver-sim/  simulated phosphenes, pattern player, JSON log lines
     app/           the program: engine, window (minifb), control panel, stimulation glue
   models/          ONNX model file (not included) and how to get it
-  (planned) crates/tactile-link/   serial sender and golden-vector export for the FPGA
+  crates/tactile-link/   packet, pattern ROM, scheduler model, golden-vector export, serial sender (feature `serial`)
   (planned) fpga/                  RTL, testbenches, constraints, board notes
   (repo root)      tms_wearable_concept.scad / .stl / .png and make_tms_wearable.py: non-functional CAD shells
 ```

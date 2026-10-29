@@ -1,0 +1,18 @@
+[package]
+name = "neurosight-tactile-link"
+version.workspace = true
+edition.workspace = true
+description = "Wire format, pattern ROM and golden vectors for the NeuroSight FPGA tactile output"
+
+[features]
+# Real serial port sender (off by default so the crate builds with no system libraries).
+serial = ["dep:serialport"]
+
+[dependencies]
+neurosight-common = { path = "../common" }
+neurosight-encoder = { path = "../encoder" }
+serialport = { version = "4", default-features = false, optional = true }
+
+[[bin]]
+name = "export-vectors"
+path = "src/bin/export_vectors.rs"
